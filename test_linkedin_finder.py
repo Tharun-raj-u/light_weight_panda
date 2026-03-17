@@ -1,4 +1,4 @@
-"""Test suite for LinkedIn Profile Finder API v4.0."""
+"""Test suite for LinkedIn Profile Finder API v5.0."""
 import httpx
 import time
 import sys
@@ -19,7 +19,7 @@ def report(name: str, ok: bool, detail: str = ""):
 
 
 print("=" * 62)
-print("  LinkedIn Profile Finder API v4.0 — Test Suite")
+print("  LinkedIn Profile Finder API v5.0 — Test Suite")
 print("=" * 62)
 
 # ---- 1: Health ----

@@ -1,242 +1,49 @@
 """
-LinkedIn Profile Finder API  —  v4.1  (Browser-only, race mode)
-=====================================================
+LinkedIn Profile Finder API  —  v5.0  (Go CDP proxy + multi-browser)
+=====================================================================
 
-## What it does
-Accepts a person's **name** (+ optional company / location) and returns
-the most-likely **LinkedIn profile URL** with a confidence score.
+Accepts a person's name (+ optional company / location) and returns the
+most-likely LinkedIn profile URL with a confidence score.
 
-## Architecture
+Architecture
+------------
+  Client  →  FastAPI (:8888)  →  Go CDP Proxy (:9333)  →  N × Lightpanda browsers
 
-    ┌──────────┐   POST /search     ┌────────────────┐
-    │  Client  │ ─────────────────▶ │  FastAPI (8888) │
-    └──────────┘   JSON body        └───────┬────────┘
-                                            │
-                      ┌─────────────────────┼─────────────────────┐
-                      │  1. check in-memory cache (TTLCache)      │
-                      │     hit → return instantly                 │
-                      │  2. build query: "{name} LinkedIn {co}"   │
-                      └─────────────────────┬─────────────────────┘
-                                            │ miss
-                      ┌─────────────────────┴─────────────────────┐
-                      ▼                                           ▼
-            ┌─────────────────┐                         ┌─────────────────┐
-            │   DuckDuckGo    │     ◀── race ──▶        │    Startpage    │
-            │  (Lightpanda)   │   first HIGH wins       │  (Lightpanda)   │
-            └────────┬────────┘   & cancels loser       └────────┬────────┘
-                     │                                           │
-                     ▼                                           ▼
-               ┌───────────┐                              ┌───────────┐
-               │ Lightpanda│                              │ Lightpanda│
-               │ CDP (9222)│                              │ CDP (9222)│
-               └───────────┘                              └───────────┘
+Search flow
+-----------
+  1. Check in-memory TTL cache → hit = instant return.
+  2. Build query: "{name} LinkedIn {company} {location}".
+  3. Race DuckDuckGo & Startpage in parallel via ``asyncio.wait(FIRST_COMPLETED)``.
+     First engine to return a HIGH-confidence match wins; the loser is cancelled.
+  4. Each engine URL is fetched as ``POST /fetch`` to the Go CDP proxy, which
+     round-robins across 10 Lightpanda browser containers (30 concurrent
+     sessions each = 300 total capacity).
+  5. Parse HTML with BeautifulSoup + lxml; extract ``linkedin.com/in/`` URLs.
+  6. Score candidates with word-boundary name matching + company match.
+  7. If no result, retry with ``site:`` and keyword-style queries (3 passes).
+  8. Cache result for 1 hour.
 
-    3. Parse HTML (lxml) → extract all linkedin.com/in/ URLs
-       (supports country subdomains: in.linkedin.com, es.linkedin.com, …)
-    4. Score candidates — word-boundary name match + company match
-       → high / medium / low / none
-    5. First engine to return HIGH confidence wins → cancel the other
-       If neither is HIGH, combine results and pick best
-    6. Store in cache (1 h TTL)
+Endpoints
+---------
+  POST /search          — lookup by name / company / location
+  POST /search/custom   — raw query string
+  POST /search/batch    — up to 100 concurrent lookups
+  GET  /health          — status, cache size, uptime
+  GET  /cache/stats     — cache statistics
+  DELETE /cache         — clear cache
+  GET  /docs            — Swagger UI
 
-    Three search passes if needed:
-      Pass 1 — broad: "{name} LinkedIn {company} {location}"
-      Pass 2 — site:  "site:linkedin.com/in/ {name} {company}"
-      Pass 3 — keyword: "{name} {company} {location} linkedin.com/in"
-
-## Search flow detail
-
-  **All searches go through the Lightpanda browser (CDP)**
-    Two engines (DuckDuckGo + Startpage) race in parallel.  The first
-    engine to return a HIGH-confidence match wins; the slower engine is
-    cancelled immediately (``asyncio.wait(FIRST_COMPLETED)``).
-
-    For each engine a fresh WebSocket is opened to the Lightpanda Docker
-    container (ws://127.0.0.1:9222/).  Via the Chrome DevTools Protocol:
-      Target.createBrowserContext → Target.createTarget → attachToTarget
-      → Page.navigate → wait for DOMContentLoaded/load → DOM.getOuterHTML
-    The returned HTML is parsed with BeautifulSoup + lxml.
-
-## Available API Endpoints
-  ─────────────────────────────────────────────────────────────────────
-
-  ### POST /search                              [tag: Search]
-    Find a person's LinkedIn profile by name, company, and location.
-
-    Request body (JSON):
-      {
-        "name":     "Satya Nadella",     // required  (1-200 chars)
-        "company":  "Microsoft",         // optional  (max 200 chars)
-        "location": "Seattle"            // optional  (max 200 chars)
-      }
-
-    Response body (JSON):
-      {
-        "name":              "Satya Nadella",
-        "company":           "Microsoft",
-        "location":          "Seattle",
-        "linkedin_url":      "https://www.linkedin.com/in/satyanadella",
-        "profile_name":      "Satya Nadella",
-        "profile_headline":  "Chairman and CEO at Microsoft",
-        "confidence":        "high",          // high | medium | low
-        "engine":            "duckduckgo",    // duckduckgo | startpage | google
-        "cached":            false,
-        "search_time_ms":    3651
-      }
-
-  ### POST /search/custom                       [tag: Search]
-    Free-form search — you supply the exact query string.
-
-    Request body (JSON):
-      {
-        "query": "Satya Nadella CEO Microsoft linkedin.com/in"
-                                          // required  (1-500 chars)
-      }
-
-    Response body (JSON):
-      {
-        "query":              "Satya Nadella CEO Microsoft linkedin.com/in",
-        "linkedin_url":       "https://www.linkedin.com/in/satyanadella",
-        "all_linkedin_urls":  [
-          "https://www.linkedin.com/in/satyanadella",
-          "https://www.linkedin.com/in/othermatch"
-        ],
-        "confidence":         "medium",
-        "engine":             "duckduckgo",
-        "cached":             false,
-        "search_time_ms":     4092
-      }
-
-  ### POST /search/batch                        [tag: Search]
-    Batch lookup — up to 100 people in one request, all concurrent.
-
-    Request body (JSON):
-      {
-        "queries": [
-          {"name": "Satya Nadella", "company": "Microsoft"},
-          {"name": "Sundar Pichai", "company": "Google"}
-        ]                                 // 1-100 items
-      }
-
-    Response body (JSON):
-      {
-        "total":          2,
-        "found":          2,
-        "results":        [ ...LinkedInResult objects... ],
-        "total_time_ms":  15980
-      }
-
-  ### GET /health                               [tag: System]
-    Health check. Browser flag refreshes at most every 30 s.
-
-    Response body (JSON):
-      {
-        "status":             "ok",
-        "cache_size":         42,
-        "cache_max":          10000,
-        "uptime_seconds":     3600,
-        "engines":            ["duckduckgo", "startpage"],
-        "browser_available":  true
-      }
-
-  ### GET /cache/stats                          [tag: System]
-    Current cache statistics.
-
-    Response body (JSON):
-      {
-        "size":         42,
-        "max_size":     10000,
-        "ttl_seconds":  3600
-      }
-
-  ### DELETE /cache                             [tag: System]
-    Clear the entire result cache.
-
-    Response body (JSON):
-      { "status": "cleared" }
-
-  ### GET /docs                                 [built-in]
-    Swagger UI — interactive API documentation (auto-generated).
-
-  ### GET /openapi.json                         [built-in]
-    OpenAPI 3.1 schema (machine-readable).
-
-  ─────────────────────────────────────────────────────────────────────
-
-## Error Responses
-
-    422  — Validation error (missing/invalid fields).
-           Body: {"detail": [{"loc":["body","name"],"msg":"...","type":"..."}]}
-
-    429  — Rate limit exceeded (500 requests/second).
-           Body: {"detail": "Rate limit exceeded (500 RPS)"}
-
-    500  — Internal server error (upstream search failure).
-           Body: {"detail": "error description"}
-
-## Performance (benchmarked 2026-03-17)
-
-  | Scenario                | Throughput              |
-  |-------------------------|-------------------------|
-  | Cached lookups          | 126 – 155 RPS           |
-  | Health endpoint         | 138 – 155 RPS           |
-  | Cached batch (10)       | 3 600 lookups/s         |
-  | Uncached batch (10)     | 10/10 found in ~13 s    |
-  | Single uncached lookup  | 3 – 4 s                 |
-
-  **Configuration tuning:**
-    CDP_MAX_CONCURRENT   = 30   (parallel Lightpanda sessions)
-    MAX_RPS              = 500  (rate limiter cap)
-    CACHE_TTL_SECONDS    = 3600 (1 hour)
-    CACHE_MAX_SIZE       = 10000
-
-  For multi-worker scaling set WORKERS=N env var (default 1).
-  Note: each worker keeps its own in-memory cache.
-
-## Prerequisites
-
-    docker run -d --name lightpanda --restart=always \\
-               -p 9222:9222 lightpanda/browser:nightly
-    pip install fastapi uvicorn httpx websockets beautifulsoup4 cachetools lxml
-
-    ⚠️  The Lightpanda browser is REQUIRED — there is no HTTP fallback.
-
-## Quick Start
-
-    python linkedin_finder.py
-
-    # Single lookup
-    curl -X POST http://localhost:8888/search \\
-         -H "Content-Type: application/json" \\
-         -d '{"name": "Satya Nadella", "company": "Microsoft"}'
-
-    # Custom raw search query
-    curl -X POST http://localhost:8888/search/custom \\
-         -H "Content-Type: application/json" \\
-         -d '{"query": "Satya Nadella CEO Microsoft linkedin.com/in"}'
-
-    # Batch (up to 100)
-    curl -X POST http://localhost:8888/search/batch \\
-         -H "Content-Type: application/json" \\
-         -d '{"queries": [{"name":"Satya Nadella","company":"Microsoft"},
-                          {"name":"Sundar Pichai","company":"Google"}]}'
-
-    # Health check
-    curl http://localhost:8888/health
-
-    # Cache stats / clear
-    curl http://localhost:8888/cache/stats
-    curl -X DELETE http://localhost:8888/cache
-
-    # Interactive docs
-    open http://localhost:8888/docs
+Quick start
+-----------
+  docker compose up -d --build          # 10 browsers + Go proxy
+  pip install fastapi uvicorn httpx beautifulsoup4 cachetools lxml
+  python linkedin_finder.py             # API on http://localhost:8888
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import re
 import time
 import urllib.parse
@@ -246,7 +53,6 @@ from typing import Optional
 
 import httpx
 import uvicorn
-import websockets
 from bs4 import BeautifulSoup
 from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Request
@@ -260,19 +66,11 @@ from pydantic import BaseModel, Field
 
 API_PORT = 8888
 
-CDP_WS_URL = "ws://127.0.0.1:9222/"
-CDP_MAX_CONCURRENT = 30          # parallel browser sessions
-CDP_PAGE_TIMEOUT = 10.0           # seconds per page load
+CDP_PROXY_URL = "http://127.0.0.1:9333"   # Go proxy
+CDP_FETCH_TIMEOUT = 10.0                  # seconds per page load
 
 CACHE_MAX_SIZE = 10_000
 CACHE_TTL_SECONDS = 3600
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-]
 
 # ============================================================================
 # Pydantic Models  — Request / Response
@@ -357,20 +155,13 @@ class HealthResponse(BaseModel):
 # Global State
 # ============================================================================
 
-_cdp_semaphore: Optional[asyncio.Semaphore] = None
+_proxy_client: Optional[httpx.AsyncClient] = None
 _cache: TTLCache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
 _cache_lock: asyncio.Lock = asyncio.Lock()
 _start_time: float = 0
-_ua_counter: int = 0
 _browser_available: bool = False
 _browser_check_time: float = 0
 _BROWSER_CHECK_INTERVAL = 30.0   # re-probe Lightpanda every 30 s
-
-
-def _next_ua() -> str:
-    global _ua_counter
-    _ua_counter += 1
-    return USER_AGENTS[_ua_counter % len(USER_AGENTS)]
 
 
 def _cache_key(*parts: str) -> str:
@@ -467,111 +258,21 @@ def _build_query(name: str, company: str, location: str) -> str:
 
 
 # ============================================================================
-# Lightpanda CDP helper
+# Go CDP proxy helper
 # ============================================================================
 
 
-async def _cdp_fetch_html(url: str, timeout: float = CDP_PAGE_TIMEOUT) -> str:
-    """Navigate Lightpanda to *url* via CDP and return the rendered HTML."""
-    async with _cdp_semaphore:
-        msg_id = 0
-
-        async def send(ws, method, params=None, session_id=None):
-            nonlocal msg_id
-            msg_id += 1
-            msg: dict = {"id": msg_id, "method": method}
-            if params:
-                msg["params"] = params
-            if session_id:
-                msg["sessionId"] = session_id
-            await ws.send(json.dumps(msg))
-            return msg_id
-
-        async def recv_until(ws, target_id, deadline):
-            events: list[dict] = []
-            while time.monotonic() < deadline:
-                remaining = max(0.1, deadline - time.monotonic())
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 3))
-                    data = json.loads(raw)
-                    if data.get("id") == target_id:
-                        return data, events
-                    events.append(data)
-                except asyncio.TimeoutError:
-                    continue
-            return None, events
-
-        deadline = time.monotonic() + timeout
-        async with websockets.connect(
-            CDP_WS_URL, max_size=10 * 1024 * 1024,
-            open_timeout=5, close_timeout=1,
-        ) as ws:
-            rid = await send(ws, "Target.createBrowserContext")
-            resp, _ = await recv_until(ws, rid, deadline)
-            if resp is None or "error" in resp:
-                raise RuntimeError(f"createBrowserContext failed: {resp}")
-            ctx_id = resp["result"]["browserContextId"]
-
-            try:
-                rid = await send(ws, "Target.createTarget",
-                                 {"url": "about:blank", "browserContextId": ctx_id})
-                resp, _ = await recv_until(ws, rid, deadline)
-                target_id = resp["result"]["targetId"]
-
-                rid = await send(ws, "Target.attachToTarget",
-                                 {"targetId": target_id, "flatten": True})
-                resp, _ = await recv_until(ws, rid, deadline)
-                session_id = resp["result"]["sessionId"]
-
-                rid = await send(ws, "Page.enable", session_id=session_id)
-                await recv_until(ws, rid, deadline)
-                rid = await send(ws, "Page.setLifecycleEventsEnabled",
-                                 {"enabled": True}, session_id=session_id)
-                await recv_until(ws, rid, deadline)
-
-                rid = await send(ws, "Page.navigate", {"url": url},
-                                 session_id=session_id)
-                await recv_until(ws, rid, deadline)
-
-                _READY_EVENTS = {
-                    "networkIdle", "networkAlmostIdle",
-                    "DOMContentLoaded", "load",
-                }
-                while time.monotonic() < deadline:
-                    remaining = max(0.1, deadline - time.monotonic())
-                    try:
-                        raw = await asyncio.wait_for(
-                            ws.recv(), timeout=min(remaining, 3))
-                        data = json.loads(raw)
-                        if data.get("method") == "Page.lifecycleEvent":
-                            evt = data.get("params", {}).get("name", "")
-                            if evt in _READY_EVENTS:
-                                break
-                    except asyncio.TimeoutError:
-                        break
-
-                rid = await send(ws, "DOM.getDocument", {"depth": 0},
-                                 session_id=session_id)
-                resp, _ = await recv_until(ws, rid, deadline)
-                root_id = resp["result"]["root"]["nodeId"]
-
-                rid = await send(ws, "DOM.getOuterHTML", {"nodeId": root_id},
-                                 session_id=session_id)
-                resp, _ = await recv_until(ws, rid, deadline)
-                return resp["result"]["outerHTML"]
-
-            finally:
-                try:
-                    rid = await send(ws, "Target.closeTarget", {"targetId": target_id})
-                    await recv_until(ws, rid, time.monotonic() + 0.5)
-                except Exception:
-                    pass
-                try:
-                    rid = await send(ws, "Target.disposeBrowserContext",
-                                     {"browserContextId": ctx_id})
-                    await recv_until(ws, rid, time.monotonic() + 0.5)
-                except Exception:
-                    pass
+async def _cdp_fetch_html(url: str, timeout: float = CDP_FETCH_TIMEOUT) -> str:
+    """Fetch rendered HTML via the Go CDP proxy (round-robins across browsers)."""
+    resp = await _proxy_client.post(
+        f"{CDP_PROXY_URL}/fetch",
+        json={"url": url, "timeout": timeout},
+        timeout=timeout + 3,
+    )
+    data = resp.json()
+    if data.get("error"):
+        raise RuntimeError(f"CDP proxy: {data['error']}")
+    return data.get("html", "")
 
 
 # ============================================================================
@@ -884,9 +585,10 @@ async def _find_linkedin_custom(query: str) -> CustomSearchResult:
 
 
 async def _check_browser() -> bool:
+    """Check if the Go CDP proxy is reachable."""
     try:
         async with httpx.AsyncClient(timeout=3) as c:
-            r = await c.get("http://127.0.0.1:9222/json/version")
+            r = await c.get(f"{CDP_PROXY_URL}/health")
             return r.status_code == 200
     except Exception:
         return False
@@ -894,19 +596,22 @@ async def _check_browser() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _cdp_semaphore, _start_time, _browser_available
+    global _proxy_client, _start_time, _browser_available
     _start_time = time.time()
-    _cdp_semaphore = asyncio.Semaphore(CDP_MAX_CONCURRENT)
+    _proxy_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(CDP_FETCH_TIMEOUT + 5),
+        limits=httpx.Limits(max_connections=300, max_keepalive_connections=100),
+    )
     _browser_available = await _check_browser()
 
     print()
     print("=" * 62)
-    print("  🔗  LinkedIn Profile Finder API v4.0 (Browser-only)")
+    print("  🔗  LinkedIn Profile Finder API v5.0 (Go proxy + multi-browser)")
     print("=" * 62)
-    brow = f"✅ Lightpanda CDP @ {CDP_WS_URL}" if _browser_available else "❌ Not found — browser required!"
+    brow = f"✅ Go CDP proxy @ {CDP_PROXY_URL}" if _browser_available else "❌ Not found — proxy required!"
     print(f"  Port            : {API_PORT}")
     print(f"  Engines         : DuckDuckGo, Startpage  (race pattern)")
-    print(f"  Browser         : {brow}")
+    print(f"  CDP proxy       : {brow}")
     print(f"  Cache           : {CACHE_MAX_SIZE} entries, {CACHE_TTL_SECONDS}s TTL")
     print()
     print("  Endpoints:")
@@ -918,16 +623,17 @@ async def lifespan(app: FastAPI):
     print("=" * 62)
     print()
     if not _browser_available:
-        print("  ⚠️  WARNING: Lightpanda browser not detected!")
-        print("  Run: docker run -d --name lightpanda --restart=always -p 9222:9222 lightpanda/browser:nightly")
+        print("  ⚠️  WARNING: Go CDP proxy not detected!")
+        print("  Run: docker compose up -d --build")
         print()
     yield
+    await _proxy_client.aclose()
 
 
 app = FastAPI(
     title="LinkedIn Profile Finder API",
     description=__doc__,
-    version="4.1.0",
+    version="5.0.0",
     lifespan=lifespan,
 )
 

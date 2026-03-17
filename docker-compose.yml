@@ -1,0 +1,72 @@
+# LinkedIn Profile Finder — Multi-browser stack
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose logs -f cdp-proxy          # watch proxy logs
+#   docker compose ps                         # check all containers
+#   docker compose down                       # stop everything
+#
+# Scaling:
+#   To add more browsers, copy a lightpanda-N block and update
+#   BROWSER_COUNT in cdp-proxy environment.
+#   Rule of thumb: 1 browser ≈ 30 concurrent CDP sessions.
+#   For 100 RPS uncached @ ~3 s/fetch → need ~15 browsers.
+
+x-browser: &browser
+  image: lightpanda/browser:nightly
+  restart: always
+  deploy:
+    resources:
+      limits:
+        memory: 256M
+
+services:
+  # ───── 10 Lightpanda browser instances ─────
+  lightpanda-1:
+    <<: *browser
+  lightpanda-2:
+    <<: *browser
+  lightpanda-3:
+    <<: *browser
+  lightpanda-4:
+    <<: *browser
+  lightpanda-5:
+    <<: *browser
+  lightpanda-6:
+    <<: *browser
+  lightpanda-7:
+    <<: *browser
+  lightpanda-8:
+    <<: *browser
+  lightpanda-9:
+    <<: *browser
+  lightpanda-10:
+    <<: *browser
+
+  # ───── Go CDP proxy (load-balances across browsers) ─────
+  cdp-proxy:
+    build: ./cdp-proxy
+    ports:
+      - "9333:9333"
+    environment:
+      PORT: "9333"
+      BROWSER_COUNT: "10"
+      BROWSER_PREFIX: "lightpanda"
+      BROWSER_PORT: "9222"
+      MAX_PER_BROWSER: "30"
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    depends_on:
+      - lightpanda-1
+      - lightpanda-2
+      - lightpanda-3
+      - lightpanda-4
+      - lightpanda-5
+      - lightpanda-6
+      - lightpanda-7
+      - lightpanda-8
+      - lightpanda-9
+      - lightpanda-10
