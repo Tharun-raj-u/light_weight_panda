@@ -43,6 +43,22 @@ services:
   lightpanda-10:
     <<: *browser
 
+  # ───── FastAPI LinkedIn Finder ─────
+  linkedin-api:
+    build: .
+    ports:
+      - "8888:8888"
+    environment:
+      CDP_PROXY_URL: "http://cdp-proxy:9333"
+      WORKERS: "2"
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    depends_on:
+      - cdp-proxy
+
   # ───── Go CDP proxy (load-balances across browsers) ─────
   cdp-proxy:
     build: ./cdp-proxy

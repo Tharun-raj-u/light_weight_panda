@@ -66,7 +66,8 @@ from pydantic import BaseModel, Field
 
 API_PORT = 8888
 
-CDP_PROXY_URL = "http://127.0.0.1:9333"   # Go proxy
+import os as _os
+CDP_PROXY_URL = _os.environ.get("CDP_PROXY_URL", "http://127.0.0.1:9333")
 CDP_FETCH_TIMEOUT = 10.0                  # seconds per page load
 
 CACHE_MAX_SIZE = 10_000
