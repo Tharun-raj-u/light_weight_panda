@@ -1,0 +1,56 @@
+# ── All-in-One: Lightpanda + CDP Proxy + FastAPI ─────────
+# Single container for EasyPanel / single-service platforms
+#
+# Contains:
+#   1. Lightpanda browser  (port 9222 internal)
+#   2. Go CDP proxy        (port 9333 internal)
+#   3. FastAPI API          (port 8888 exposed)
+#
+# Usage:
+#   docker build -f Dockerfile.easypanel -t linkedin-finder .
+#   docker run -p 8888:8888 linkedin-finder
+
+# ── Stage 1: Build the Go CDP proxy ──
+FROM golang:1.22-alpine AS go-builder
+WORKDIR /src
+COPY cdp-proxy/ .
+RUN go mod tidy && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /cdp-proxy .
+
+# ── Stage 2: Copy Lightpanda binary from official image ──
+FROM lightpanda/browser:nightly AS lp-bin
+
+# ── Stage 3: Final image ──
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    CDP_PROXY_URL="http://127.0.0.1:9333" \
+    WORKERS=1
+
+# Install supervisor + tini
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends supervisor tini && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy Lightpanda binary from official image
+COPY --from=lp-bin /bin/lightpanda /usr/local/bin/lightpanda
+
+# Copy the Go CDP proxy binary from build stage
+COPY --from=go-builder /cdp-proxy /usr/local/bin/cdp-proxy
+
+# Install Python dependencies
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY linkedin_finder.py .
+
+# Copy supervisord config
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+EXPOSE 8888
+
+ENTRYPOINT ["tini", "--"]
+CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
