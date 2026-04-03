@@ -13,7 +13,7 @@ Search flow
 -----------
   1. Check in-memory TTL cache → hit = instant return.
   2. Build query: "{name} LinkedIn {company} {location}".
-  3. Race DuckDuckGo & Startpage in parallel via ``asyncio.wait(FIRST_COMPLETED)``.
+  3. Race OpnXNG & Yahoo Search in parallel via ``asyncio.wait(FIRST_COMPLETED)``.
      First engine to return a HIGH-confidence match wins; the loser is cancelled.
   4. Each engine URL is fetched as ``POST /fetch`` to the Go CDP proxy, which
      round-robins across 10 Lightpanda browser containers (30 concurrent
@@ -69,6 +69,9 @@ API_PORT = 8888
 import os as _os
 CDP_PROXY_URL = _os.environ.get("CDP_PROXY_URL", "http://127.0.0.1:9333")
 CDP_FETCH_TIMEOUT = 10.0                  # seconds per page load
+
+# OpnXNG (SearXNG) — primary search backend URL (see tests for contract checks).
+OPNXNG_SEARCH_URL = "https://opnxng.com/search"
 
 CACHE_MAX_SIZE = 10_000
 CACHE_TTL_SECONDS = 3600
@@ -281,16 +284,16 @@ async def _cdp_fetch_html(url: str, timeout: float = CDP_FETCH_TIMEOUT) -> str:
 # ============================================================================
 
 
-async def _search_duckduckgo(query: str) -> list[dict]:
-    """Search DuckDuckGo via the Lightpanda browser."""
-    url = f"https://duckduckgo.com/?q={urllib.parse.quote(query)}&t=h_&ia=web"
-    return _parse_duckduckgo_html(await _cdp_fetch_html(url))
+async def _search_opnxng(query: str) -> list[dict]:
+    """Search OpnXNG (SearXNG) via the Lightpanda browser."""
+    url = f"{OPNXNG_SEARCH_URL}?q={urllib.parse.quote(query)}"
+    return _parse_opnxng_html(await _cdp_fetch_html(url))
 
 
-async def _search_startpage(query: str) -> list[dict]:
-    """Search Startpage via the Lightpanda browser."""
-    url = f"https://www.startpage.com/sp/search?query={urllib.parse.quote(query)}&cat=web"
-    return _parse_startpage_html(await _cdp_fetch_html(url))
+async def _search_yahoo(query: str) -> list[dict]:
+    """Search Yahoo via the Lightpanda browser."""
+    url = f"https://search.yahoo.com/search?p={urllib.parse.quote(query)}"
+    return _parse_yahoo_html(await _cdp_fetch_html(url))
 
 
 async def _safe_search(fn, query: str) -> list[dict]:
@@ -301,8 +304,8 @@ async def _safe_search(fn, query: str) -> list[dict]:
 
 
 _ENGINES: list[tuple[str, object]] = [
-    ("duckduckgo", _search_duckduckgo),
-    ("startpage", _search_startpage),
+    ("opnxng", _search_opnxng),
+    ("yahoo", _search_yahoo),
 ]
 
 
@@ -356,39 +359,57 @@ async def _race_engines(
 # ============================================================================
 
 
-def _parse_duckduckgo_html(html: str) -> list[dict]:
+def _unwrap_yahoo_redirect(href: str) -> str:
+    """Resolve Yahoo ``r.search.yahoo.com`` wrapper links (``/RU=…`` target URL)."""
+    if not href:
+        return href
+    if "/RU=" in href or href.startswith("RU="):
+        m = re.search(r"/RU=([^/]+)", href)
+        if not m:
+            m = re.search(r"(?:^|[?&])RU=([^&]+)", href)
+        if m:
+            return urllib.parse.unquote(m.group(1))
+    return href
+
+
+def _parse_opnxng_html(html: str) -> list[dict]:
+    """Parse OpnXNG / SearXNG-style result markup."""
     soup = BeautifulSoup(html, "lxml")
     results: list[dict] = []
 
-    for item in soup.select(".result.results_links"):
-        title_el = item.select_one(".result__a")
-        snippet_el = item.select_one(".result__snippet")
+    for item in soup.select("article.result, article.result-default, div.result.result-default"):
+        title_el = item.select_one("h3.result-title a, h3 a, h4 a, .result-title a")
         if not title_el:
             continue
-        href = title_el.get("href", "")
-        if "uddg=" in href:
-            m = re.search(r"uddg=([^&]+)", href)
-            if m:
-                href = urllib.parse.unquote(m.group(1))
+        href = title_el.get("href", "").strip()
+        if not href or href.startswith("#"):
+            continue
+        if href.startswith("/"):
+            href = urllib.parse.urljoin("https://opnxng.com/", href)
+        snippet_el = item.select_one("p.content, .content, .result-content, .result-snippet")
+        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
         results.append({
             "title": title_el.get_text(strip=True),
             "url": href,
-            "snippet": snippet_el.get_text(strip=True) if snippet_el else "",
+            "snippet": snippet,
         })
 
     if not results:
-        for a in soup.select("a[data-testid='result-title-a']"):
-            href = a.get("href", "")
-            if href:
-                results.append({"title": a.get_text(strip=True), "url": href, "snippet": ""})
+        for h in soup.select(".result h3 a, .result h4 a"):
+            href = h.get("href", "").strip()
+            if not href:
+                continue
+            if href.startswith("/"):
+                href = urllib.parse.urljoin("https://opnxng.com/", href)
+            results.append({"title": h.get_text(strip=True), "url": href, "snippet": ""})
 
     if not results:
+        seen: set[str] = set()
         for a in soup.select("a[href*='linkedin.com/in/']"):
             href = a.get("href", "")
-            if "uddg=" in href:
-                m = re.search(r"uddg=([^&]+)", href)
-                if m:
-                    href = urllib.parse.unquote(m.group(1))
+            if href in seen:
+                continue
+            seen.add(href)
             results.append({"title": a.get_text(strip=True) or href, "url": href, "snippet": ""})
 
     if not results:
@@ -398,38 +419,48 @@ def _parse_duckduckgo_html(html: str) -> list[dict]:
     return results
 
 
-def _parse_startpage_html(html: str) -> list[dict]:
+def _parse_yahoo_html(html: str) -> list[dict]:
+    """Parse Yahoo web search results (organic block)."""
     soup = BeautifulSoup(html, "lxml")
     results: list[dict] = []
 
-    for item in soup.select(".result"):
-        link_el = item.select_one("a.result-link") or item.find("a", href=True)
+    for item in soup.select("#web .algo-sr"):
+        link_el = item.select_one(".compTitle a[href]")
         if not link_el:
             continue
-        href = link_el.get("href", "")
-        if not href or href.startswith(("#", "javascript")):
-            continue
-        title_el = item.select_one(".result-title, h3")
-        title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
-        snippet_el = item.select_one(".result-snippet, p")
+        raw_href = link_el.get("href", "")
+        href = _unwrap_yahoo_redirect(raw_href)
+        title = link_el.get_text(strip=True)
+        snippet_el = item.select_one(".compText p, .compText")
         snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-        results.append({"title": title, "url": href, "snippet": snippet})
+        if href:
+            results.append({"title": title, "url": href, "snippet": snippet})
 
     if not results:
-        for item in soup.select(".w-gl__result"):
-            link_el = item.select_one("a[href]")
-            if link_el:
-                results.append({"title": link_el.get_text(strip=True),
-                                "url": link_el.get("href", ""), "snippet": ""})
+        for item in soup.select("#web ol li .dd"):
+            link_el = item.select_one(".compTitle a[href]")
+            if not link_el:
+                continue
+            href = _unwrap_yahoo_redirect(link_el.get("href", ""))
+            if not href:
+                continue
+            snippet_el = item.select_one(".compText p, p")
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            results.append({
+                "title": link_el.get_text(strip=True),
+                "url": href,
+                "snippet": snippet,
+            })
 
     if not results:
         seen: set[str] = set()
         for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "linkedin.com/in/" in href and href not in seen:
-                seen.add(href)
-                results.append({"title": a.get_text(strip=True) or href,
-                                "url": href, "snippet": ""})
+            href = _unwrap_yahoo_redirect(a["href"])
+            if "linkedin.com/in/" not in href or href in seen:
+                continue
+            seen.add(href)
+            results.append({"title": a.get_text(strip=True) or href, "url": href, "snippet": ""})
+
     return results
 
 
@@ -537,9 +568,9 @@ async def _find_linkedin_custom(query: str) -> CustomSearchResult:
         return CustomSearchResult(**{**cached, "cached": True,
                                      "search_time_ms": int((time.monotonic() - t0) * 1000)})
 
-    ddg, sp = await asyncio.gather(
-        _safe_search(_search_duckduckgo, query),
-        _safe_search(_search_startpage, query),
+    ox, yh = await asyncio.gather(
+        _safe_search(_search_opnxng, query),
+        _safe_search(_search_yahoo, query),
     )
 
     all_urls: list[str] = []
@@ -547,7 +578,7 @@ async def _find_linkedin_custom(query: str) -> CustomSearchResult:
     best_conf: str = "low"
     best_engine: Optional[str] = None
 
-    for engine, results in [("duckduckgo", ddg), ("startpage", sp)]:
+    for engine, results in [("opnxng", ox), ("yahoo", yh)]:
         for r in results:
             url = r.get("url", "")
             if _LINKEDIN_COMPANY.search(url):
@@ -611,7 +642,7 @@ async def lifespan(app: FastAPI):
     print("=" * 62)
     brow = f"✅ Go CDP proxy @ {CDP_PROXY_URL}" if _browser_available else "❌ Not found — proxy required!"
     print(f"  Port            : {API_PORT}")
-    print(f"  Engines         : DuckDuckGo, Startpage  (race pattern)")
+    print(f"  Engines         : OpnXNG, Yahoo Search  (race pattern)")
     print(f"  CDP proxy       : {brow}")
     print(f"  Cache           : {CACHE_MAX_SIZE} entries, {CACHE_TTL_SECONDS}s TTL")
     print()
@@ -675,7 +706,7 @@ async def health():
     return HealthResponse(
         status="ok", cache_size=len(_cache), cache_max=CACHE_MAX_SIZE,
         uptime_seconds=int(time.time() - _start_time),
-        engines=["duckduckgo", "startpage"],
+        engines=["opnxng", "yahoo"],
         browser_available=_browser_available,
     )
 
@@ -695,7 +726,7 @@ async def search(req: SearchRequest):
     ```
 
     The system builds a query like `Satya Nadella LinkedIn Microsoft Seattle`,
-    sends it through DuckDuckGo & Startpage (via the Lightpanda browser),
+    sends it through OpnXNG & Yahoo Search (via the Lightpanda browser),
     then extracts and scores the best linkedin.com/in/ URL.
     """
     try:

@@ -2,10 +2,34 @@
 import httpx
 import time
 import sys
+import urllib.parse
+
+# Must match linkedin_finder.OPNXNG_SEARCH_URL (primary engine: OpnXNG).
+EXPECTED_OPNXNG_SEARCH = "https://opnxng.com/search"
 
 BASE = "http://localhost:8888"
 passed = 0
 failed = 0
+
+# Compose starts containers before uvicorn is accepting; wait before tests.
+WAIT_API_SEC = 120
+
+
+def wait_for_api() -> bool:
+    print(f"\n[0] Waiting for API at {BASE} (up to {WAIT_API_SEC}s)…")
+    t0 = time.time()
+    deadline = t0 + WAIT_API_SEC
+    while time.time() < deadline:
+        try:
+            r = httpx.get(f"{BASE}/health", timeout=3)
+            if r.status_code == 200:
+                print(f"  ✅ API ready  ({int(time.time() - t0)}s elapsed)")
+                return True
+        except Exception:
+            pass
+        time.sleep(0.75)
+    print("  ❌ Timed out — is `docker compose up -d` running and port 8888 published?")
+    return False
 
 
 def report(name: str, ok: bool, detail: str = ""):
@@ -20,15 +44,25 @@ def report(name: str, ok: bool, detail: str = ""):
 
 print("=" * 62)
 print("  LinkedIn Profile Finder API v5.0 — Test Suite")
+print(f"  OpnXNG search: {EXPECTED_OPNXNG_SEARCH}?q=…")
 print("=" * 62)
+
+if not wait_for_api():
+    sys.exit(1)
 
 # ---- 1: Health ----
 print("\n[1] GET /health")
 try:
     r = httpx.get(f"{BASE}/health", timeout=10)
     d = r.json()
-    report("/health", r.status_code == 200,
-           f"browser={d.get('browser_available')}  engines={d.get('engines')}")
+    eng = d.get("engines") or []
+    ok = (
+        r.status_code == 200
+        and "opnxng" in eng
+        and "yahoo" in eng
+    )
+    report("/health", ok,
+           f"browser={d.get('browser_available')}  engines={eng}")
 except Exception as e:
     report("/health", False, str(e))
 
@@ -161,6 +195,27 @@ try:
     report("name-only", ok, f"url={url}  conf={d.get('confidence')}")
 except Exception as e:
     report("name-only", False, str(e))
+
+# ---- 12: OpnXNG URL in code + live https://opnxng.com/search ----
+print("\n[12] OpnXNG — configured URL matches & public search responds")
+try:
+    from linkedin_finder import OPNXNG_SEARCH_URL
+
+    ok_cfg = OPNXNG_SEARCH_URL.rstrip("/") == EXPECTED_OPNXNG_SEARCH.rstrip("/")
+    probe_url = f"{OPNXNG_SEARCH_URL.rstrip('/')}?q={urllib.parse.quote('linkedin test')}"
+    r = httpx.get(probe_url, timeout=20, follow_redirects=True)
+    # Any HTTP status from the server (e.g. 200 HTML, 429 rate limit) means the endpoint is reachable.
+    ok_http = r.status_code < 600
+    ok = ok_cfg and ok_http
+    snippet = (r.text or "")[:120].replace("\n", " ")
+    report(
+        "OpnXNG search URL",
+        ok,
+        f"url={OPNXNG_SEARCH_URL}  GET {probe_url[:56]}…  "
+        f"http={r.status_code}  bytes={len(r.content)}  head={snippet!r}",
+    )
+except Exception as e:
+    report("OpnXNG search URL", False, str(e))
 
 # ---- Summary ----
 total = passed + failed

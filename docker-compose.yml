@@ -50,14 +50,28 @@ services:
       - "8888:8888"
     environment:
       CDP_PROXY_URL: "http://cdp-proxy:9333"
-      WORKERS: "2"
+      # One worker fits 256M; use WORKERS=2 only if you raise mem limits.
+      WORKERS: "1"
     restart: always
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 384M
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 18
+      start_period: 45s
     depends_on:
-      - cdp-proxy
+      cdp-proxy:
+        condition: service_healthy
 
   # ───── Go CDP proxy (load-balances across browsers) ─────
   cdp-proxy:
@@ -75,6 +89,19 @@ services:
       resources:
         limits:
           memory: 128M
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "-O-",
+          "http://127.0.0.1:9333/health",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 25s
     depends_on:
       - lightpanda-1
       - lightpanda-2
